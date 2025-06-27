@@ -1,0 +1,155 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <FS.h>
+#include "SPIFFS.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+#include <DHT.h>
+
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// WiFi
+const char* WIFI_SSID = "ahmed";
+const char* WIFI_PASS = "00000000";
+
+// API
+const char* API_UPLOAD = "http://YOUR_BACKEND_IP:PORT/upload";
+const char* API_HISTORY = "http://YOUR_BACKEND_IP:PORT/history";
+const char* API_KEY = "SUPER_SECRET_KEY";
+const char* ERROR_WEBHOOK = "http://YOUR_BACKEND_IP:PORT/alert";
+
+// Sensors
+#define DHT_PIN 4
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+const int ldrPin = 35;
+const int soilMoisturePin = 32;
+const int soilSalinityPin = 33;
+const int pirPin = 19;
+
+// Output pins
+const int motorPin1 = 26;
+const int motorPin2 = 27;
+const int motorEnable = 2;
+const int motorPin3 = 14;
+const int buzzerPin = 18;
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+WebServer server(80);
+
+String lastAIResult = "Not analyzed yet";
+String lastImageUrl = "";
+
+bool wifiReady = false;
+unsigned long lastShot = 0;
+unsigned long lastPostTime = 0;
+const unsigned long interval = 10 * 60 * 1000;
+const int maxWifiConnectAttempts = 10;
+
+bool relayState = false;
+bool motionDetected = false;
+
+void setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_CIF;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+}
+
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  for (int i = 0; i < maxWifiConnectAttempts; i++) {
+    if (WiFi.status() == WL_CONNECTED) break;
+    delay(500);
+  }
+  wifiReady = (WiFi.status() == WL_CONNECTED);
+}
+
+int readLDR() {
+  return analogRead(ldrPin);
+}
+
+int readSoilMoisturePercentage() {
+  int raw = analogRead(soilMoisturePin);
+  return constrain(map(raw, 4095, 0, 0, 100), 0, 100);
+}
+
+int readSoilSalinityPercentage() {
+  int raw = analogRead(soilSalinityPin);
+  return constrain(map(raw, 0, 4095, 0, 100), 0, 100);
+}
+
+float readTemperature() {
+  return dht.readTemperature();
+}
+
+float readHumidity() {
+  return dht.readHumidity();
+}
+
+void updateDisplay(bool motion) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.print("Temp: ");
+  display.print(readTemperature());
+  display.println(" C");
+  display.print("Humidity: ");
+  display.print(readHumidity());
+  display.println(" %");
+  display.print("Soil Moist: ");
+  display.print(readSoilMoisturePercentage());
+  display.println(" %");
+  display.print("Soil Salt: ");
+  display.print(readSoilSalinityPercentage());
+  display.println(" %");
+  display.print("LDR: ");
+  display.println(readLDR());
+  display.print("Motion: ");
+  display.println(motion ? "Detected" : "None");
+  display.print("AI: ");
+  display.println(lastAIResult);
+  display.display();
+}
