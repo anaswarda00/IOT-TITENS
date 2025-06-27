@@ -1,0 +1,309 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <HTTPClient.h> // لإرسال البيانات للسيرفر
+
+// WiFi credentials
+const char* ssid = "ahmed's iphone";
+const char* password = "00000000";
+
+// Web server on port 80
+WebServer server(80);
+
+// Pin definitions
+const int relayPin = 23;
+const int pirPin = 19;
+const int buzzerPin = 18;
+const int ldrPin = 35;
+const int soilMoisturePin = 32;
+const int soilSalinityPin = 33;
+const int motorPin1 = 26;
+const int motorPin2 = 27;
+const int motorEnable = 2;
+const int motorPin3 = 14;
+
+// DHT sensor setup
+#define DHT_PIN 4
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// OLED screen setup
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// متغيرات النظام
+bool relayState = false;
+unsigned long delayStart = 0;
+bool delayActive = false;
+bool delayTargetState = false;
+const int maxWifiConnectAttempts = 10;
+bool wifiConnected = false;
+bool motionDetected = false;
+unsigned long lastPostTime = 0;
+
+const char* htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Control</title>
+    <style>
+        body { font-family: Arial; text-align: center; margin-top: 50px; }
+        button { padding: 20px; font-size: 18px; margin: 10px; }
+        p { font-size: 20px; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h1>ESP32 Control</h1>
+    <p>حالة الجهاز: <span id="relayStatus">%s</span></p>
+    <button onclick="sendCommand('on')">تشغيل</button>
+    <button onclick="sendCommand('off')">إيقاف</button>
+    <button onclick="sendCommand('delayon')">تشغيل بعد 5 ثواني</button>
+    <button onclick="sendCommand('delayoff')">إيقاف بعد 5 ثواني</button>
+    <script>
+        function sendCommand(cmd) {
+            fetch('/' + cmd)
+                .then(response => response.text())
+                .then(data => {
+                    document.getElementById('relayStatus').textContent = data === 'ON' ? 'يعمل' : (data === 'OFF' ? 'مطفأ' : data);
+                });
+        }
+        document.addEventListener('DOMContentLoaded', function() {
+            updateRelayStatus();
+        });
+        function updateRelayStatus() {
+            fetch('/status')
+                .then(response => response.text())
+                .then(data => {
+                    document.getElementById('relayStatus').textContent = data === 'ON' ? 'يعمل' : 'مطفأ';
+                });
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+    char buffer[2048];
+    sprintf(buffer, htmlPage, relayState ? "يعمل" : "مطفأ");
+    server.send(200, "text/html", buffer);
+}
+
+void handleOn() {
+    digitalWrite(motorPin1, HIGH);
+    digitalWrite(motorPin2, LOW);
+    digitalWrite(motorPin3, HIGH);
+    analogWrite(motorEnable, 255);
+    relayState = true;
+    delayActive = false;
+    server.send(200, "text/plain", "ON");
+}
+
+void handleOff() {
+    digitalWrite(motorPin1, LOW);
+    digitalWrite(motorPin2, LOW);
+    digitalWrite(motorPin3, LOW);
+    analogWrite(motorEnable, 0);
+    relayState = false;
+    delayActive = false;
+    server.send(200, "text/plain", "OFF");
+}
+
+void handleDelayOn() {
+    delayStart = millis();
+    delayTargetState = true;
+    delayActive = true;
+    server.send(200, "text/plain", "Delayed ON");
+}
+
+void handleDelayOff() {
+    delayStart = millis();
+    delayTargetState = false;
+    delayActive = true;
+    server.send(200, "text/plain", "Delayed OFF");
+}
+
+void handleStatus() {
+    server.send(200, "text/plain", relayState ? "ON" : "OFF");
+}
+
+int readLDR() {
+    return analogRead(ldrPin);
+}
+
+int readSoilMoisturePercentage() {
+    int raw = analogRead(soilMoisturePin);
+    return constrain(map(raw, 4095, 0, 0, 100), 0, 100);
+}
+
+int readSoilSalinityPercentage() {
+    int raw = analogRead(soilSalinityPin);
+    return constrain(map(raw, 0, 4095, 0, 100), 0, 100);
+}
+
+float readTemperature() {
+    return dht.readTemperature();
+}
+
+float readHumidity() {
+    return dht.readHumidity();
+}
+
+void updateDisplay(bool motion) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    display.print("Relay: ");
+    display.println(relayState ? "ON" : "OFF");
+    display.print("Temp: ");
+    display.print(readTemperature());
+    display.println(" C");
+    display.print("Humidity: ");
+    display.print(readHumidity());
+    display.println(" %");
+    display.print("SoilM: ");
+    display.print(readSoilMoisturePercentage());
+    display.println(" %");
+    display.print("SoilS: ");
+    display.print(readSoilSalinityPercentage());
+    display.println(" %");
+    display.print("Motion: ");
+    display.println(motion ? "Detected" : "None");
+    display.print("LDR: ");
+    display.println(readLDR());
+    display.print("WiFi: ");
+    display.println(wifiConnected ? "Connected" : "Disconnected");
+
+    if (wifiConnected) {
+        display.print("IP: ");
+        display.println(WiFi.localIP());
+    }
+
+    display.display();
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(motorPin1, OUTPUT);
+    pinMode(motorPin2, OUTPUT);
+    pinMode(motorPin3, OUTPUT);
+    pinMode(motorEnable, OUTPUT);
+    pinMode(pirPin, INPUT);
+    pinMode(buzzerPin, OUTPUT);
+    digitalWrite(buzzerPin, LOW);
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("فشل في تشغيل الشاشة"));
+        while (true);
+    }
+
+    dht.begin();
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.println("جاري الاتصال...");
+    display.display();
+
+    WiFi.begin(ssid, password);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < maxWifiConnectAttempts) {
+        delay(500);
+        Serial.println("جاري الاتصال بالواي فاي...");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.println("تم الاتصال. IP:");
+        Serial.println(WiFi.localIP());
+
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("WiFi متصل");
+        display.println(WiFi.localIP());
+        display.display();
+
+        server.on("/", handleRoot);
+        server.on("/on", handleOn);
+        server.on("/off", handleOff);
+        server.on("/delayon", handleDelayOn);
+        server.on("/delayoff", handleDelayOff);
+        server.on("/status", handleStatus);
+        server.begin();
+    } else {
+        wifiConnected = false;
+        Serial.println("فشل في الاتصال بالواي فاي.");
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("WiFi غير متصل");
+        display.display();
+    }
+}
+
+void loop() {
+    if (wifiConnected) {
+        server.handleClient();
+    }
+
+    if (delayActive && millis() - delayStart >= 5000) {
+        digitalWrite(motorPin1, delayTargetState ? HIGH : LOW);
+        digitalWrite(motorPin2, delayTargetState ? LOW : HIGH);
+        digitalWrite(motorPin3, delayTargetState ? HIGH : LOW);
+        analogWrite(motorEnable, delayTargetState ? 255 : 0);
+        relayState = delayTargetState;
+        delayActive = false;
+    }
+
+    motionDetected = digitalRead(pirPin);
+    digitalWrite(buzzerPin, motionDetected ? HIGH : LOW);
+
+    int soilMoisturePercent = readSoilMoisturePercentage();
+    if (soilMoisturePercent < 10) {
+        digitalWrite(motorPin1, HIGH);
+        digitalWrite(motorPin2, LOW);
+        digitalWrite(motorPin3, HIGH);
+        analogWrite(motorEnable, 255);
+    } else {
+        digitalWrite(motorPin1, LOW);
+        digitalWrite(motorPin2, LOW);
+        digitalWrite(motorPin3, LOW);
+        analogWrite(motorEnable, 0);
+    }
+
+    updateDisplay(motionDetected);
+
+    // إرسال بيانات للمخدم
+    if (wifiConnected && millis() - lastPostTime > 10000) {
+        lastPostTime = millis();
+
+        HTTPClient http;
+        http.begin("http://<YOUR_SERVER_IP>:5000/esp32/data"); // <-- غيّر IP
+
+        http.addHeader("Content-Type", "application/json");
+        String payload = "{";
+        payload += "\"esp_id\":\"ESP32_001\",";
+        payload += "\"soil_moisture\":" + String(readSoilMoisturePercentage()) + ",";
+        payload += "\"tds\":" + String(readSoilSalinityPercentage()) + ",";
+        payload += "\"temperature\":" + String(readTemperature()) + ",";
+        payload += "\"humidity\":" + String(readHumidity()) + ",";
+        payload += "\"ldr\":" + String(readLDR()) + ",";
+        payload += "\"motor_status\":\"" + String(relayState ? "on" : "off") + "\",";
+        payload += "\"pump_status\":\"" + String(relayState ? "on" : "off") + "\",";
+        payload += "\"sr206_motion\":" + String(motionDetected ? "true" : "false");
+        payload += "}";
+
+        int code = http.POST(payload);
+        Serial.println("POST code: " + String(code));
+        http.end();
+    }
+
+    delay(200);
+}
